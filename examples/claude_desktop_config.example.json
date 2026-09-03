@@ -1,0 +1,10 @@
+{
+  "_comment_1": "Example Claude Desktop config. The file lives at ~/Library/Application Support/Claude/claude_desktop_config.json on macOS.",
+  "_comment_2": "This is all you need — no API keys, no OAuth. Just be logged into (or have recently visited) reddit.com in Chrome.",
+  "mcpServers": {
+    "reddit": {
+      "command": "uvx",
+      "args": ["reddit-mcp-chrome"]
+    }
+  }
+}

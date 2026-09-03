@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reddit-mcp-chrome"
+version = "0.1.0"
+description = "Reddit MCP server for Claude Desktop that bypasses Reddit's anti-scraping using your Chrome browser session cookies and Chrome TLS impersonation."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Kugamon", email = "contact@kugamon.com" },
+]
+keywords = [
+    "reddit",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude",
+    "claude-desktop",
+    "chrome",
+    "session-cookie",
+    "curl-cffi",
+    "tls-impersonation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "reddit-no-auth-mcp-server>=0.1.2",
+    "curl-cffi>=0.7",
+    "pycookiecheat>=0.7",
+    # httpx is an *optional* dep of redd (only needed for the AsyncRedd class).
+    # We import redd.adapters.http_async in patch.py to install the async
+    # patch, which requires httpx to be present. Declaring it explicitly here
+    # ensures uvx resolves an environment where our patch import succeeds.
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/kugamon/reddit-mcp-chrome"
+Repository = "https://github.com/kugamon/reddit-mcp-chrome"
+Issues = "https://github.com/kugamon/reddit-mcp-chrome/issues"
+
+[project.scripts]
+reddit-mcp-chrome = "reddit_mcp_chrome.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reddit_mcp_chrome"]
