@@ -1,123 +1,97 @@
 # How it works
 
-This doc captures the architecture and the design decisions, including the diagnostics we ran and the workarounds we discarded. If you're forking or extending this package, or hitting a similar anti-scraping wall on another site, read this before changing anything load-bearing.
+The architecture, the history, and the decisions behind them. Read this before changing anything load-bearing, or if you're hitting the same kind of wall on another site.
 
-## The core insight
+## Timeline
 
-Reddit's `.json` endpoints are the fastest way to programmatically get structured Reddit data — every subreddit page, every user profile, and every post has a `.json` variant that returns the same content as machine-readable JSON. `reddit-no-auth-mcp-server` (and the `redd` library it uses) rely on these endpoints entirely.
+| When | What happened |
+| --- | --- |
+| Sep 2026 | v0.1.0 ships. Wraps `reddit-no-auth-mcp-server`, which scrapes Reddit's `.json` endpoints via the `redd` library. Our addition: Chrome session cookies plus a `curl_cffi` Chrome TLS fingerprint, because plain Python HTTP clients already got 403. |
+| Early Nov 2026 | Every tool call starts returning `HTTP 403`. Server still starts and lists tools fine. |
+| Nov 2026 | v0.2.0: rewritten to read Reddit through a real Chrome window. |
 
-**Reddit systematically blocks unauthenticated `.json` requests** as part of their anti-scraping policy (tightened significantly in 2023–2024 after the API pricing changes). The block is applied on three signals:
+## The November 2026 diagnosis
 
-1. **TLS fingerprint** — Python's `requests` and `httpx` use OpenSSL with a distinctive ClientHello that Chrome doesn't produce (JA3 hash).
-2. **HTTP/2 fingerprint** — Chrome sends specific SETTINGS frames on connection setup; Python HTTP libraries don't.
-3. **Session cookies** — Chrome accumulates cookies (`loid`, `csv`, `edgebucket`, and optionally `reddit_session`) that signal "this is a real browser session that visited Reddit at some point." Requests without these cookies are treated as bot traffic.
+We tested each layer separately to find what broke.
 
-Any two of these failing = 403. All three failing = 403 with no retry-after. To get through, all three must look like a real Chrome browser.
+| Test | Result |
+| --- | --- |
+| Chrome still has Reddit cookies (`reddit_session`, `loid`, `csv`, ...) | Yes, 18 of them |
+| Our patch still attaches to `redd`'s HTTP adapters | Yes, `redd` 0.2.1 kept the same classes |
+| `curl_cffi` chrome142, 145, 146, 150, 151, 152 (and `_macos` variants), with cookies | 403 on every one |
+| Same profiles without cookies | 403 |
+| Latest upstream `redd` 0.2.1, no patch at all | 403 "Blocked" |
+| Plain `curl` to an HTML page (`/r/salesforce/`) | 200 |
+| Real Chrome, headless, fresh profile | "Prove your humanity" page, then 403 |
+| Real Chrome, visible window, fresh profile | Pages load normally, no challenge |
+| `fetch('/r/salesforce/hot.json')` from inside that visible window | **403** |
+| Official API | Not an option: Reddit isn't approving new API apps |
 
-## The three-signal fix
+Two conclusions:
+
+1. **The `.json` route is closed for anonymous clients everywhere**, including a genuine browser. It's not a fingerprint problem we can fix by impersonating better. `reddit-no-auth-mcp-server` is affected the same way.
+2. **Reddit's rendered pages still load in a normal browser window.** That's the remaining route.
+
+A side finding: v0.1 pinned `curl_cffi`'s `chrome131` profile, and `curl_cffi` 0.17 no longer ships it. That would have broken v0.1 eventually regardless.
+
+## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│  Claude Desktop                                                │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  claude_desktop_config.json                              │  │
-│  │  "command": "uvx",                                       │  │
-│  │  "args": ["reddit-mcp-chrome"]                           │  │
-│  └─────────────┬────────────────────────────────────────────┘  │
-└────────────────┼───────────────────────────────────────────────┘
-                 │ launches via stdio
-                 ▼
-┌────────────────────────────────────────────────────────────────┐
-│  reddit-mcp-chrome (this package)                              │
-│                                                                │
-│  __main__.py                                                   │
-│  ├── calls patch.install()                                     │
-│  └── hands off to reddit-no-auth-mcp-server's main()           │
-│                                                                │
-│  patch.py                                                      │
-│  ├── reads Chrome's Reddit cookies via pycookiecheat            │
-│  ├── creates curl_cffi Session with impersonate="chrome131"    │
-│  └── monkey-patches redd.adapters.http_{sync,async} .get()     │
-│                                                                │
-│  auth.py                                                       │
-│  └── chrome_cookies("https://www.reddit.com") → dict           │
-└────────────────────────────────────────────────────────────────┘
-                 │
-                 │ delegates to
-                 ▼
-┌────────────────────────────────────────────────────────────────┐
-│  reddit-no-auth-mcp-server + redd  (unmodified, from PyPI)     │
-│  └── every HTTP call goes through the patched adapter          │
-│      └── curl_cffi sends the request with:                     │
-│          • Chrome 131 TLS ClientHello                          │
-│          • Chrome 131 HTTP/2 SETTINGS                          │
-│          • Chrome 131 header order                             │
-│          • User's real Reddit cookies from Chrome              │
-└────────────────────────────────────────────────────────────────┘
-                 │
-                 ▼
-            Reddit's .json endpoints → 200 OK
+Claude Desktop
+   │ stdio (MCP)
+   ▼
+server.py      six tools, input validation, result clean-up
+   │ holds one lock: one page load at a time
+   ▼
+browser.py     launches installed Chrome via Playwright on first call
+   │           profile: ~/.reddit-mcp-chrome/profile
+   │           window parked at (-2400, -2400)
+   │           ≥ 2 s between page loads
+   │           human check → move window on screen, fail the call
+   ▼
+extract.py     JavaScript run inside the page, returns plain dicts
+   ▼
+www.reddit.com rendered pages
 ```
 
-## Why monkey-patch, why not fork
+The server is our own [FastMCP](https://gofastmcp.com) app now, not a wrapper. We kept the six tool names and argument names from `reddit-no-auth-mcp-server` so prompts and skills written for v0.1 work unchanged.
 
-`redd` is a thin, actively-maintained Reddit scraping library. `reddit-no-auth-mcp-server` is an even thinner MCP-protocol shell on top. Forking either to add TLS impersonation would mean:
+## Reading the rendered pages
 
-- Maintaining a fork forever (or PR'ing upstream and waiting)
-- Diverging from the upstream when they ship features or fixes
-- Users tracking two packages
+Reddit's current web app renders content as custom elements, and most of the useful data sits in their attributes rather than in visible text. That makes extraction far more stable than scraping text.
 
-Instead we treat both as black boxes and patch the one method in each of `redd`'s HTTP adapters — the sync `RequestsHttpAdapter.get()` and the async `HttpxAsyncAdapter.get()`. Both live at `redd.adapters.http_sync` / `http_async` and both are called by every `redd` operation.
+| Element | Where it appears | What we read |
+| --- | --- | --- |
+| `<shreddit-post>` | Feeds, post pages, user pages | `id`, `post-title`, `author`, `score`, `comment-count`, `created-timestamp`, `permalink`, `subreddit-prefixed-name`, `post-type`; body from `[slot="text-body"]` |
+| `<shreddit-comment>` | Post pages | `thingid`, `author`, `score`, `depth`, `created`, `permalink`; body from `#<thingid>-comment-rtjson-content` |
+| `[data-testid="search-post-unit"]` | Search results | A `search-telemetry-tracker` inside carries JSON (post id, title, author, subreddit); votes and comment counts parsed from the card text |
+| `<shreddit-profile-comment>` | User overview | `comment-id`, `href`; body from an `*rtjson-content` node |
 
-If `redd` ever switches its HTTP layer (unlikely — `requests` and `httpx` are the de-facto Python HTTP libraries), this package will need an update. Small risk, and easy to notice: the patch would just stop applying.
+All selectors live in `extract.py`. If Reddit renames something, only that file changes.
 
-## Why curl_cffi and not selenium/playwright
+Three details that took testing to get right:
 
-We could run a headless Chrome via Playwright, load Reddit pages, and scrape the DOM. That works — it's what `stickerdaniel/linkedin-mcp-server` does for LinkedIn. But it's heavy:
+- **Results render 2–4 seconds after the page loads.** `collect()` waits for the expected element (up to 8 s) before reading. Without this, subreddit search returned nothing.
+- **Feeds are virtualised**: older cards are removed from the page as you scroll. Items are accumulated by id across scroll rounds instead of counted on the page.
+- **Collapsed replies have empty `innerText`.** Comment bodies fall back to `textContent`.
 
-- ~100 MB Chromium download
-- Multi-second startup per request
-- Playwright process management + resource churn
-- More attack surface for LinkedIn/Reddit to detect (browser automation flags)
+## What we deliberately don't do
 
-`curl_cffi` gives us the exact same TLS fingerprint as a real Chrome browser — because it compiles curl with BoringSSL and matches Chrome's TLS extensions byte-for-byte — but without spinning up an actual browser. Requests take ~200ms, cold start is negligible, and there's no browser process to babysit.
+- **No headless mode.** Headless gets challenged. A visible window parked offscreen is honest about what it is: a normal Chrome window.
+- **No fingerprint spoofing or stealth patches.** We use the installed Chrome as-is via Playwright.
+- **No CAPTCHA solving.** On a human check, the window moves on screen and the call fails with a message asking the user to complete it. The saved profile keeps the result.
+- **No bulk collection.** One window, one page load at a time, at least 2 seconds apart, at most 100 items per call.
 
-The trade-off: `curl_cffi` can only replay a static fingerprint. If Reddit ever adds JS-based challenges (Cloudflare Turnstile, etc.), we'd need to fall back to a real browser. But their current defenses are pure network-level fingerprinting, which `curl_cffi` handles cleanly.
+If Reddit tightens further so that a plain, paced, real browser window no longer works, the right response is to stop, not to escalate.
 
-## What we tried first and discarded
+## Why our own profile, not your everyday Chrome
 
-| Attempt | Why it failed |
-|---|---|
-| Realistic User-Agent header + `requests` library | 403 — Reddit checks TLS fingerprint, not just User-Agent |
-| `curl_cffi` with Chrome 131 impersonation, no cookies | 403 — TLS was right, but no session cookies means "no real browser" |
-| Chrome cookies + `requests` library (no TLS impersonation) | 403 — Cookies were valid but TLS gave it away |
-| Read cookies via Chrome DevTools Protocol on `--remote-debugging-port=9222` | Works but requires Chrome to be started with the debug flag; way too much friction for users |
-| Cache cookies to disk with a 5-minute TTL | Not worth it — `pycookiecheat` reads Chrome's store in sub-100ms |
-| Use `praw` (the official Reddit API library) | Requires creating a Reddit app + OAuth flow per user; whole point of `reddit-no-auth-mcp-server` is that it doesn't need one |
+Chrome locks a profile while it's open, so automating your main profile would mean closing your browser. A separate profile also keeps the automation's cookies and history out of your own. Use `--login` once if you want it signed in.
 
-## Why cookies are read at install time (not per-request)
+## Lessons
 
-Reddit session cookies have hour(s)-long lifetimes and Chrome refreshes them constantly (any Reddit page load extends them). Reading them once at MCP server startup is nearly always enough for the duration of a Claude Desktop session.
-
-If a long-running Claude session goes stale — say, the user's session cookie expires mid-day — the wrapper will start returning 403 on tool calls. Restart Claude Desktop and cookies get re-read.
-
-We could re-read on every request (like `salesforce-mcp-auto-auth-chrome` does with the `sid` cookie), but Reddit sessions are much longer-lived than Salesforce sessions and Reddit is much less critical to keep fresh mid-conversation. The added per-request latency isn't worth it.
-
-## Why chrome131 (and how to bump it)
-
-`curl_cffi` ships Chrome impersonation profiles named after Chrome versions: `chrome116`, `chrome120`, `chrome124`, `chrome131`, etc. Each is a snapshot of that Chrome version's TLS ClientHello, HTTP/2 SETTINGS, and header order. Newer profiles look more like current Chrome to modern anti-bot systems.
-
-We picked `chrome131` because it's the latest profile `curl_cffi` shipped at the time of v0.1.0 release, and Reddit's anti-bot accepts it. When Reddit tightens further:
-
-1. Check `curl_cffi`'s [supported impersonations](https://github.com/lexiforest/curl_cffi#supported-impersonations) for the newest Chrome profile.
-2. Bump the `IMPERSONATE` constant in `patch.py` and release a new version.
-
-`curl_cffi` typically ships new Chrome profiles within a few weeks of a stable Chrome release, so this is low-effort maintenance.
-
-## What we learned that's generally useful for anti-scraping MCP wrappers
-
-1. **Multiple detection signals combine multiplicatively.** Getting TLS right AND cookies right AND HTTP/2 right isn't optional if any one of them fails. Test each in isolation to know which one you're missing.
-2. **Read the user's actual browser state, don't fake it.** Cookies from a real Chrome session are better than any synthetic session you could construct. Chrome refreshes them for free while the user browses normally.
-3. **Impersonate at the network layer, not the browser layer.** `curl_cffi` gives you Chrome's TLS fingerprint without Chrome's memory footprint. Reserve headless-browser scraping (Playwright, Selenium) for sites that require JS execution or DOM interaction.
-4. **Don't fork upstream.** Monkey-patching the HTTP boundary of an existing package is almost always cleaner than maintaining a fork. When the boundary is one or two functions, the patch is trivial and upstream improvements flow through.
-5. **Pin transitive SDKs that reach you through another package** (see `salesforce-mcp-auto-auth-chrome`'s lesson #6 for the full story). This isn't a problem here today because `redd` is stable, but it's worth watching if `reddit-no-auth-mcp-server` ever adds new transitive deps.
+1. **When a scraping route breaks, test from the most legitimate client first.** Checking `.json` from inside a real browser window told us in one step that no amount of impersonation would help, before we spent time on newer TLS profiles.
+2. **Keep all site-specific selectors in one file.** Markup changes are the most likely future breakage; they should be a one-file fix.
+3. **Wait for what you need, not a fixed delay.** Client-rendered sites finish at different times per page type.
+4. **Pin every SDK major you depend on.** `mcp` 2.0 broke `mcp-salesforce-connector` and `fastmcp` 4.0 broke `mcp-server-linkedin`. This package pins `fastmcp<4` and `playwright<2` from day one.
+5. **Keep tool names stable across rewrites.** Users' prompts and skills reference tool names; v0.2 changed everything underneath without changing them.

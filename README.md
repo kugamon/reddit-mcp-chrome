@@ -1,70 +1,69 @@
-# Reddit MCP Server — Uses Your Chrome Session
+# Reddit MCP Server — Reads Reddit Through Chrome
 
 [![PyPI](https://img.shields.io/pypi/v/reddit-mcp-chrome?label=pypi&color=blue)](https://pypi.org/project/reddit-mcp-chrome/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#)
 
-A local MCP server that exposes Reddit search, subreddit browsing, and post-detail tools inside Claude Desktop — and **bypasses Reddit's anti-scraping** by using your Chrome browser's session cookies plus a real Chrome TLS fingerprint. Wraps [`reddit-no-auth-mcp-server`](https://pypi.org/project/reddit-no-auth-mcp-server/) (which uses [`redd`](https://pypi.org/project/redd/)) and swaps its HTTP layer for `curl_cffi` so Reddit treats requests as coming from your real browser.
+A local MCP server that gives Claude Desktop **six Reddit tools** (search all of Reddit, search a subreddit, browse a subreddit, read a post with its comments, see a user's activity, list a user's posts) by **reading Reddit through a real Chrome window** kept out of sight. No Reddit API key, no OAuth app.
 
-No Reddit API key, no OAuth, no personal-use API application — just be logged into (or have recently visited) reddit.com in Chrome.
+Why a browser: as of November 2026 Reddit blocks its `.json` endpoints for every anonymous client and isn't approving new API apps. A normal Chrome window still loads Reddit's pages, so that's what this uses.
 
 ---
 
 ## How it fits together
 
 ```
-Claude Desktop ── stdio ──▶ this package (Python) ── HTTPS ──▶ Reddit JSON API
-       │                            │                          (via curl_cffi with
-       │                            │                           Chrome TLS fingerprint)
-       │                            │
-       │                            └─ reads cookies ──▶ Chrome cookies on disk
-       │                               once at startup      (macOS Keychain)
-       │
-       └── one entry in claude_desktop_config.json
+Claude Desktop ── stdio ──▶ this package (Python) ── Playwright ──▶ Chrome window (offscreen)
+                                   │                                     │
+                                   │                                     ▼
+                                   │                               www.reddit.com pages
+                                   │                                     │
+                                   └──── reads posts/comments from ◀────┘
+                                         the rendered page
 ```
 
-The package is a thin Python shim around `reddit-no-auth-mcp-server`. At startup, it reads your Chrome cookies for `reddit.com` (the `loid`, `csv`, `edgebucket`, `reddit_session` set) and monkey-patches `redd`'s HTTP adapters to use `curl_cffi` — a Python HTTP client that impersonates real Chrome's TLS handshake byte-for-byte. Reddit's anti-bot layer sees requests that look identical to your real browser and lets them through.
+On the first tool call the server starts your installed Google Chrome with its own profile (`~/.reddit-mcp-chrome/profile`, separate from your everyday Chrome) and parks the window offscreen. Each tool loads the matching Reddit page and reads the structured data Reddit's web app puts on its post and comment elements. One window serves every call, with about 2 seconds between page loads.
 
 ---
 
 ## Files in this repo
 
-- **`src/reddit_mcp_chrome/__main__.py`** — entry point. Installs the patch, then hands off to `reddit-no-auth-mcp-server`.
-- **`src/reddit_mcp_chrome/patch.py`** — monkey-patches `redd.adapters.http_sync.RequestsHttpAdapter.get` and `redd.adapters.http_async.HttpxAsyncAdapter.get` to route through `curl_cffi` with Chrome cookies + `chrome131` impersonation.
-- **`src/reddit_mcp_chrome/auth.py`** — reads Reddit cookies from Chrome via `pycookiecheat`. Returns an empty dict on any failure so the caller can decide how to handle it.
-- **`pyproject.toml`** — package metadata + entry point. `uvx` reads this when launching.
-- **`examples/claude_desktop_config.example.json`** — copy-paste-ready Claude Desktop config snippet.
-- **`docs/how-it-works.md`** — full architecture write-up with the design decisions, what we tried and discarded (curl_cffi alone, cookies alone, cookies + curl_cffi together), and the lessons that generalize to other anti-scraped MCP wrappers.
+- **`src/reddit_mcp_chrome/server.py`** — the six MCP tools. Names and arguments match [`reddit-no-auth-mcp-server`](https://pypi.org/project/reddit-no-auth-mcp-server/), so prompts written for v0.1 keep working.
+- **`src/reddit_mcp_chrome/browser.py`** — starts and owns the Chrome window, paces page loads, detects human checks and moves the window on screen when one appears.
+- **`src/reddit_mcp_chrome/extract.py`** — the JavaScript that reads posts, comments and search results from Reddit's pages. If Reddit changes its markup, this is the only file to update.
+- **`src/reddit_mcp_chrome/__main__.py`** — entry point, plus the `--login` option.
+- **`pyproject.toml`** — package metadata. Pins `fastmcp<4` and `playwright<2`.
+- **`examples/claude_desktop_config.example.json`** — copy-paste config.
+- **`docs/how-it-works.md`** — the full story: the v0.1 design, why it stopped working, what we tested, and why this one is built the way it is.
 
 ---
 
 ## Setup — Part 1: Add to Claude Desktop (~1 min, one-time)
 
+**Needs:** macOS, Google Chrome, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
+
 ### Fastest path — have Claude do it for you
 
-If Claude Desktop already has filesystem access to your home directory (Cowork mode users do by default), you don't need to touch JSON at all. Paste the following into a fresh Claude chat:
+If Claude Desktop has filesystem access to your home directory (Cowork mode does by default), paste this into a new chat:
 
 ```
 Add a Reddit MCP entry to my Claude Desktop config named `reddit`.
-The MCP command should be `uvx reddit-mcp-chrome` (it's on PyPI).
-No env vars, no API keys — the wrapper reads Chrome cookies at
-runtime. Make a backup of my existing config first.
+The command should be `uvx reddit-mcp-chrome` (it's on PyPI).
+No env vars or API keys. Make a backup of my existing config first.
 ```
 
-Claude reads your existing `claude_desktop_config.json`, adds the entry alongside anything already there, backs up the original, and tells you when to restart. When Claude confirms it's done, skip to **Restart Claude Desktop** below.
+Claude backs up `claude_desktop_config.json`, adds the entry next to your existing ones, and tells you when to restart. Then skip to **Restart Claude Desktop**.
 
 ### Alternate route — edit `claude_desktop_config.json` yourself
 
-If you'd rather edit JSON by hand:
-
-**1. Open your Claude Desktop config.** On macOS the file lives at:
+**1. Open the config.** On macOS:
 
 ```
 ~/Library/Application Support/Claude/claude_desktop_config.json
 ```
 
-**2. Add this entry to `mcpServers`.**
+**2. Add this entry under `mcpServers`.**
 
 ```jsonc
 {
@@ -77,156 +76,128 @@ If you'd rather edit JSON by hand:
 }
 ```
 
-That's the entire configuration — no env vars, no tokens, no API keys.
-
 ### Restart Claude Desktop
 
-Cmd+Q (a full quit — not just closing the window) and reopen. Claude Desktop reads the config at startup.
+Cmd+Q (a full quit, not just closing the window) and reopen.
 
 ### Sanity check
 
-In a new Claude conversation, ask: *"using the reddit MCP, search reddit for 'salesforce cpq' and give me the top 3 results"* — Claude will call the `reddit_search` tool. If it returns real posts, the wiring is correct.
-
-The first time the wrapper runs, macOS will prompt for Keychain access (the dialog says *"Claude wants to use your confidential information stored in 'Chrome Safe Storage'"*). Click **Always Allow** to suppress future prompts.
+Ask: *"Using the reddit MCP, show me this week's top posts in r/salesforce."* You should get a list of posts with scores and comment counts.
 
 ---
 
-## Setup — Part 2: Have Chrome visit Reddit at least once
+## Setup — Part 2: The Chrome window and the first-run check
 
-You don't need to be *logged in* — Reddit's cookies for anonymous browsing are sufficient. But you do need Chrome to have visited `reddit.com` recently enough that Chrome's cookie store has entries for the domain. If you never use Reddit in Chrome, open a tab to `https://www.reddit.com/` once, dismiss whatever consent banner appears, and you're set.
+- **A second Chrome icon appears in your Dock** while the server is running. That's its window, parked offscreen. Your normal Chrome isn't touched.
+- **Reddit may ask you to prove you're human on first use.** When that happens the window moves onto your screen and the tool call returns a message saying so. Complete the check in that window and ask Claude again. The profile remembers it, so this is usually a one-time step. The server never solves these checks itself.
+- **Signing in is optional.** Everything works signed out. If you want results as your account sees them, run this once in Terminal, sign in, then close the window:
 
-If you *are* logged in, that works too — the wrapper picks up whatever cookies are present, including the authenticated session cookie.
+  ```bash
+  uvx reddit-mcp-chrome --login
+  ```
 
 ---
 
-## The Reddit tools
+## The six tools
 
-All tools come from the underlying [`reddit-no-auth-mcp-server`](https://pypi.org/project/reddit-no-auth-mcp-server/) — this package just adds the auth-bypass layer on top.
+| Tool | What it does | Arguments |
+| --- | --- | --- |
+| `reddit_search` | Search all of Reddit for posts | `query`, `limit` (25), `sort`: relevance, hot, top, new, comments |
+| `reddit_search_subreddit` | Search posts in one subreddit | `subreddit`, `query`, `limit`, `sort` |
+| `reddit_get_subreddit_posts` | Browse a subreddit's feed | `subreddit`, `limit`, `category`: hot, new, top, rising; `time_filter` with top: hour, day, week, month, year, all |
+| `reddit_get_post` | A post plus its comments | `permalink` (path or full URL), `comment_limit` (100) |
+| `reddit_get_user` | A user's recent posts and comments, newest first | `username`, `limit` |
+| `reddit_get_user_posts` | Posts a user submitted | `username`, `limit`, `category`: hot, new, top; `time_filter` |
 
-| Tool | Purpose |
+Subreddit and user names work with or without the `r/` or `u/` prefix. `limit` caps at 100.
+
+Posts come back with title, author, subreddit, score, comment count, timestamp, permalink and (for text posts) the body. Comments come back flat in page order with a `depth` field (0 = top level).
+
+---
+
+## Typical response times
+
+Measured on a MacBook in November 2026:
+
+| Call | Time |
 | --- | --- |
-| `reddit_search` | Full-text search across all of Reddit |
-| `reddit_search_subreddit` | Full-text search scoped to one subreddit |
-| `reddit_get_subreddit_posts` | List posts from a subreddit (`hot` / `new` / `top` / `rising`) |
-| `reddit_get_post` | Get one post + its comment tree |
-| `reddit_get_user` | Get a user's profile and recent activity |
-| `reddit_get_user_posts` | List posts submitted by a user |
+| `reddit_get_user` (25 items) | ~2 s |
+| `reddit_get_subreddit_posts` (30 posts) | ~5 s |
+| `reddit_get_post` (35 comments) | ~7 s |
+| `reddit_search` (20 results) | ~20 s |
 
-Each tool's full schema is advertised through the MCP `tools/list` method — Claude reads it automatically.
+The first call after Claude Desktop starts adds a few seconds while Chrome launches. Search is the slowest because Reddit loads results as you scroll.
 
 ---
 
-## How the bypass actually works
+## Why it's built this way (vs. alternatives we tried)
 
-```
-Claude asks for r/salesforce hot posts
-  │
-  ▼
-this package's __main__.py already installed the patch at startup
-  │
-  ▼
-reddit-no-auth-mcp-server calls redd.subreddit("salesforce").hot()
-  │
-  ▼
-redd calls RequestsHttpAdapter.get()  ← OUR MONKEY-PATCH RUNS HERE
-  │
-  ├─ Uses curl_cffi session with impersonate="chrome131"
-  │  (TLS ClientHello matches real Chrome 131 byte-for-byte)
-  │
-  ├─ Attaches Reddit cookies read from Chrome
-  │  (loid, csv, edgebucket, reddit_session)
-  │
-  ▼
-HTTPS GET https://www.reddit.com/r/salesforce/hot.json?limit=25
-  User-Agent: (curl_cffi's Chrome 131 UA)
-  Cookie: loid=…; csv=…; edgebucket=…; reddit_session=…
-  │
-  ▼
-Reddit's anti-bot checks:
-  ├─ TLS fingerprint (JA3)     ✓ matches Chrome 131
-  ├─ HTTP/2 settings frame     ✓ matches Chrome 131
-  ├─ Header order              ✓ matches Chrome 131
-  ├─ Session cookies present   ✓ real user cookies
-  ▼
-200 OK, JSON body returned → MCP tool result → Claude → you
-```
+- **v0.1's approach, Chrome cookies + `curl_cffi` Chrome impersonation against `.json` endpoints**, worked from September to early November 2026, then started returning 403 on every call. We tested every `curl_cffi` Chrome profile (142 to 152), with and without cookies: all 403.
+- **The official Reddit API** isn't an option: Reddit isn't approving new API apps.
+- **Headless Chrome** gets a "Prove your humanity" page.
+- **A real Chrome window** loads Reddit normally. Even inside it, `.json` returns 403, so the tools read the rendered pages instead.
+- **Stealth or fingerprint-spoofing browsers and automated CAPTCHA solving** were deliberately left out. If Reddit wants a human check, a human does it.
+
+Details, including the full test matrix, are in [`docs/how-it-works.md`](docs/how-it-works.md).
 
 ---
 
-## Why we built it this way (vs. alternatives we tried)
+## Settings
 
-- **Just using `curl_cffi` with Chrome impersonation** — Reddit still returned 403 from the sandbox and from a real Mac IP. The TLS fingerprint alone wasn't enough; Reddit also checks for session cookies.
-- **Just using cookies with `requests`** — Reddit rejected these too. Requests has a distinctive TLS fingerprint that Reddit's anti-bot flags, cookies or no cookies.
-- **Cookies AND `curl_cffi` together** — this is what worked. Both signals need to match a real browser session.
-- **Reading cookies via Chrome DevTools Protocol** — would require running Chrome with `--remote-debugging-port=9222`, which is friction on every startup and a security surface. `pycookiecheat` reads Chrome's on-disk cookie store directly.
-- **Using the official Reddit API** — requires creating a Reddit app, getting `client_id`/`client_secret`, and OAuth flow. Fine for production but overkill for someone who just wants to search Reddit from Claude.
-- **Caching cookies across sessions** — pointless. `pycookiecheat` reads them in sub-100ms and Chrome refreshes them constantly. Simpler to just read at startup.
+All optional, set as `env` in the Claude Desktop config entry:
 
-The full architecture write-up — including the "cookies alone" and "curl_cffi alone" failure diagnostics — is in [`docs/how-it-works.md`](docs/how-it-works.md).
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `REDDIT_MCP_PROFILE_DIR` | `~/.reddit-mcp-chrome/profile` | Where the Chrome profile lives |
+| `REDDIT_MCP_SHOW_WINDOW` | off | Set to `1` to keep the window on screen (useful for debugging) |
+| `REDDIT_MCP_MIN_INTERVAL` | `2.0` | Minimum seconds between page loads |
 
 ---
 
 ## Local development
 
-If you want to test changes before pushing:
-
 ```bash
-# Install Python 3.12+ and uv if you don't have them
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and run from source
 git clone https://github.com/kugamon/reddit-mcp-chrome.git
 cd reddit-mcp-chrome
 uv sync
 
-# Smoke-test — should return real Reddit data
-uv run python -c "
-from reddit_mcp_chrome.patch import install
-install()
-from redd import Redd
-for p in Redd().search('salesforce cpq', limit=3):
-    print(p.title[:70])
-"
+# Run the server the way Claude Desktop does
+uv run reddit-mcp-chrome
 ```
 
-To point your local Claude Desktop config at the working copy instead of the published version, change the args to:
+To point Claude Desktop at a local checkout:
 
 ```jsonc
-"args": ["run", "--directory", "/absolute/path/to/your/checkout", "python", "-m", "reddit_mcp_chrome"]
+"args": ["run", "--directory", "/absolute/path/to/reddit-mcp-chrome", "reddit-mcp-chrome"]
 ```
 
 ---
 
-## Behavior reference
+## Limits and use
 
-| Chrome state | What happens |
-| --- | --- |
-| Chrome has recent Reddit cookies (any tab you've had open on reddit.com) | 200 OK, real Reddit data |
-| Chrome has never visited reddit.com | HTTP 403 — visit reddit.com once in Chrome and retry |
-| Keychain access denied | Warning logged, wrapper tries request with no cookies (usually 403) |
+- Reddit's terms restrict automated access. This is built for personal, human-scale research: a few calls at a time, paced. Don't use it to bulk-collect Reddit.
+- `reddit_get_user_posts` with `top`: Reddit doesn't show that view to signed-out visitors, so the tool returns the user's recent posts sorted by score instead.
+- Image- or GIF-only comments come back without a body.
+- Comments are what the post page renders on load, plus a few scrolls. Deeply nested threads behind "more replies" aren't expanded.
+- If you have a monitor arranged above or left of your main screen, the parked window may appear on it. Use `REDDIT_MCP_SHOW_WINDOW=1` or rearrange displays.
 
 ---
 
 ## Troubleshooting
 
-**Claude shows "Server disconnected" at startup**: Almost always means the wrapper failed to import something — usually `pycookiecheat`, `curl_cffi`, or `reddit-no-auth-mcp-server`. Look at `~/Library/Logs/Claude/mcp-server-reddit.log` for the actual Python traceback. Fix is usually `uvx --reinstall reddit-mcp-chrome`.
+**"Reddit is asking for a human check"**: The Chrome window is now on your screen. Complete the check there and ask Claude again.
 
-**Every tool call returns `HTTPError 403`**: Reddit is rejecting requests. Two things to check:
-1. Open `https://www.reddit.com/` in Chrome. If you haven't visited Reddit lately, Chrome may not have cookies. A single page load fixes this.
-2. If Chrome has cookies but you're still getting 403, Reddit may have tightened their detection — try bumping `IMPERSONATE = "chrome131"` in `patch.py` to a newer Chrome profile that `curl_cffi` supports (see [curl_cffi impersonate list](https://github.com/lexiforest/curl_cffi#supported-impersonations)).
+**"Server disconnected" at startup**: Check `~/Library/Logs/Claude/mcp-server-reddit.log` for the traceback. `uvx --refresh reddit-mcp-chrome` fixes most install problems.
 
-**Keychain prompt keeps appearing**: The first time the wrapper reads cookies, macOS asks permission to access "Chrome Safe Storage" via Keychain. Click **Always Allow** — not "Allow" — and the prompt won't return.
+**"Couldn't start a browser"**: Install Google Chrome. Or install Playwright's bundled Chromium: `uvx --from reddit-mcp-chrome playwright install chromium`.
 
-**`Cookie read failed: … pycookiecheat.KeychainError`**: You clicked "Don't Allow" on the Keychain prompt at some point. Open Keychain Access → search for "Chrome Safe Storage" → right-click → "Get Info" → "Access Control" → add the `uv` executable, or just delete the entry and let Chrome recreate it.
+**Tools return empty lists for pages that clearly have content**: Reddit probably changed its markup. Open an issue, or update the selectors in `extract.py`.
 
-**Want to use Firefox/Safari/Brave/Arc instead of Chrome**: Not yet — today the wrapper only checks Chrome's cookie store. Adding other browsers is a small change to `auth.py` (pycookiecheat supports several). PRs welcome.
-
-**Reddit changed their anti-bot and this stopped working**: The bypass depends on `curl_cffi` shipping current Chrome impersonation profiles. When Chrome ships a new major version, `curl_cffi` releases a matching profile within days. Bump `IMPERSONATE` in `patch.py` and file a PR.
-
-**Want to see what the wrapper is doing?**: Logs go to stderr, which Claude Desktop captures at `~/Library/Logs/Claude/mcp-server-reddit.log`. The wrapper prints `[reddit-mcp-chrome v0.1.0] Patched redd adapters …` at startup.
+**A Chrome window is visible when it shouldn't be**: It stays on screen after a human check until the next successful call moves it back. Ask Claude for anything on Reddit and it will park itself.
 
 ---
 
 ## Version history
 
-- **v0.1.0** — initial release on PyPI. Wraps `reddit-no-auth-mcp-server` 0.1.2. Chrome-only, macOS-only, uses `curl_cffi` `chrome131` impersonation profile.
+- **v0.2.0** — Rewritten to read Reddit through a real Chrome window (Playwright, installed Chrome, own profile, kept offscreen). Same six tool names and arguments. Adds `--login`, human-check hand-off, pacing, user-top fallback. Drops `reddit-no-auth-mcp-server`, `redd`, `curl_cffi` and `pycookiecheat`. Pins `fastmcp<4` and `playwright<2`.
+- **v0.1.0** — Wrapped `reddit-no-auth-mcp-server`, adding Chrome session cookies and `curl_cffi` Chrome TLS impersonation. Stopped working in November 2026 when Reddit blocked `.json` for anonymous clients.
