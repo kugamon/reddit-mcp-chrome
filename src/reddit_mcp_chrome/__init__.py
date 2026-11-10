@@ -1,3 +1,3 @@
-"""Reddit MCP server that bypasses anti-scraping using your Chrome browser session."""
+"""Reddit MCP server that reads Reddit through a real Chrome window."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,6 +1,6 @@
 {
   "_comment_1": "Example Claude Desktop config. The file lives at ~/Library/Application Support/Claude/claude_desktop_config.json on macOS.",
-  "_comment_2": "This is all you need — no API keys, no OAuth. Just be logged into (or have recently visited) reddit.com in Chrome.",
+  "_comment_2": "No API key or env vars needed. The server drives its own Chrome window (kept offscreen) with a profile at ~/.reddit-mcp-chrome/profile.",
   "mcpServers": {
     "reddit": {
       "command": "uvx",
